@@ -151,8 +151,28 @@ async def connect_youtube_form(user: AuthDep):
 async def connect_youtube_start(user: AuthDep, account_name: str = Form(...)):
     state = secrets.token_urlsafe(32)
     _oauth_states[state] = {"account_name": account_name, "platform": "youtube"}
-    publisher = YouTubePublisher()
-    auth_url = publisher.get_auth_url(redirect_uri=OAUTH_REDIRECT_URI, state=state)
+    try:
+        publisher = YouTubePublisher()
+        auth_url = publisher.get_auth_url(redirect_uri=OAUTH_REDIRECT_URI, state=state)
+    except (FileNotFoundError, ValueError) as e:
+        return HTMLResponse(_layout("Error", f"""
+        <div class="page-header"><h2>Configuration Error</h2></div>
+        <div class="card">
+          <p style="color:#f87171;margin-bottom:1rem;"><strong>YouTube credentials not configured correctly:</strong></p>
+          <pre style="background:#0f0f0f;padding:1rem;border-radius:6px;color:#fbbf24;font-size:.8rem;white-space:pre-wrap;">{e}</pre>
+          <p style="margin-top:1rem;color:#888;font-size:.85rem;">
+            Make sure <code>YOUTUBE_CLIENT_SECRETS_JSON</code> is set in your Coolify environment variables.
+          </p>
+          <a href="/accounts" class="btn" style="display:inline-block;margin-top:1rem;">Back to Accounts</a>
+        </div>"""), status_code=500)
+    except Exception as e:
+        logger.error(f"OAuth start failed: {e}")
+        return HTMLResponse(_layout("Error", f"""
+        <div class="page-header"><h2>Error</h2></div>
+        <div class="card">
+          <pre style="background:#0f0f0f;padding:1rem;border-radius:6px;color:#f87171;font-size:.8rem;white-space:pre-wrap;">{e}</pre>
+          <a href="/accounts" class="btn" style="display:inline-block;margin-top:1rem;">Back</a>
+        </div>"""), status_code=500)
     return RedirectResponse(url=auth_url, status_code=302)
 
 
@@ -376,6 +396,57 @@ async def delete_post(post_id: int, user: AuthDep, db: Session = Depends(get_db)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/debug", response_class=HTMLResponse)
+async def debug(user: AuthDep):
+    """Shows configuration status to help diagnose issues."""
+    client_id = os.getenv("YOUTUBE_CLIENT_ID", "")
+    client_secret = os.getenv("YOUTUBE_CLIENT_SECRET", "")
+    secrets_path = os.getenv("YOUTUBE_CLIENT_SECRETS_PATH", "auth/client_secrets.json")
+
+    checks = []
+
+    # Check YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET
+    if client_id and client_secret:
+        checks.append(("YOUTUBE_CLIENT_ID", "ok", client_id[:20] + "..."))
+        checks.append(("YOUTUBE_CLIENT_SECRET", "ok", "Set (hidden)"))
+    else:
+        checks.append(("YOUTUBE_CLIENT_ID", "error" if not client_id else "ok",
+                       "NOT SET" if not client_id else client_id[:20] + "..."))
+        checks.append(("YOUTUBE_CLIENT_SECRET", "error" if not client_secret else "ok",
+                       "NOT SET" if not client_secret else "Set (hidden)"))
+        # Check file fallback
+        if os.path.exists(secrets_path):
+            checks.append(("client_secrets.json file", "ok", f"Found at {secrets_path}"))
+        else:
+            checks.append(("client_secrets.json file", "error", f"Not found at {secrets_path}"))
+
+    # Check OAUTH_REDIRECT_URI
+    redirect_uri = os.getenv("OAUTH_REDIRECT_URI", "NOT SET")
+    checks.append(("OAUTH_REDIRECT_URI", "ok" if redirect_uri != "NOT SET" else "error", redirect_uri))
+
+    # Check DATABASE_URL
+    db_url = os.getenv("DATABASE_URL", "sqlite:///./data/viraldistributor.db (default)")
+    checks.append(("DATABASE_URL", "ok", db_url))
+
+    # Check data dir
+    checks.append(("data/ directory", "ok" if os.path.isdir("data") else "error",
+                   "exists" if os.path.isdir("data") else "MISSING — DB cannot be created"))
+
+    rows = ""
+    for name, status, detail in checks:
+        color = {"ok": "#4ade80", "warn": "#fbbf24", "error": "#f87171"}[status]
+        icon = {"ok": "OK", "warn": "WARN", "error": "ERR"}[status]
+        rows += f"<tr><td>{name}</td><td><span class='badge' style='background:#1a1a1a;color:{color};'>{icon}</span></td><td style='color:#aaa;font-size:.8rem;'>{detail}</td></tr>"
+
+    content = f"""
+    <div class="page-header"><h2>Debug — Configuration Check</h2></div>
+    <table><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead>
+    <tbody>{rows}</tbody></table>
+    <p style="margin-top:1rem;color:#555;font-size:.78rem;">Remove or restrict this endpoint in production once configured.</p>
+    """
+    return HTMLResponse(_layout("Debug", content))
 
 
 # ------------------------------------------------------------------

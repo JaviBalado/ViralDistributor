@@ -27,24 +27,45 @@ class YouTubePublisher(BasePlatformPublisher):
     """
 
     def __init__(self, credentials_json: str | None = None):
-        self._client_secrets_path = self._resolve_client_secrets()
+        self._client_config = self._build_client_config()
         self._credentials: Credentials | None = None
         if credentials_json:
             self._credentials = self._json_to_credentials(credentials_json)
 
-    def _resolve_client_secrets(self) -> str:
+    def _build_client_config(self) -> dict:
         """
-        If YOUTUBE_CLIENT_SECRETS_JSON env var is set, write it to a temp file and return that path.
-        Otherwise use YOUTUBE_CLIENT_SECRETS_PATH (file on disk).
+        Build the OAuth client config dict from environment variables.
+        Priority:
+          1. YOUTUBE_CLIENT_ID + YOUTUBE_CLIENT_SECRET  (simplest, recommended for Coolify)
+          2. YOUTUBE_CLIENT_SECRETS_PATH file on disk
         """
-        secrets_json = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON")
-        if secrets_json:
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-            tmp.write(secrets_json)
-            tmp.close()
-            return tmp.name
-        return os.getenv("YOUTUBE_CLIENT_SECRETS_PATH", "auth/client_secrets.json")
+        client_id = os.getenv("YOUTUBE_CLIENT_ID", "").strip()
+        client_secret = os.getenv("YOUTUBE_CLIENT_SECRET", "").strip()
+        redirect_uri = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:8000/auth/youtube/callback")
+
+        if client_id and client_secret:
+            logger.info("Using YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET env vars.")
+            return {
+                "web": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [redirect_uri],
+                }
+            }
+
+        # Fallback: read from file
+        path = os.getenv("YOUTUBE_CLIENT_SECRETS_PATH", "auth/client_secrets.json")
+        if os.path.exists(path):
+            logger.info(f"Using client_secrets file at {path}.")
+            with open(path) as f:
+                return json.load(f)
+
+        raise FileNotFoundError(
+            "YouTube credentials not found. Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET "
+            "in your environment variables, or provide a client_secrets.json file."
+        )
 
     # ------------------------------------------------------------------
     # Web OAuth flow (used by the dashboard to connect new accounts)
@@ -52,17 +73,17 @@ class YouTubePublisher(BasePlatformPublisher):
 
     def get_auth_url(self, redirect_uri: str, state: str) -> str:
         """Generate Google consent screen URL. Redirect user here to authorize."""
-        flow = Flow.from_client_secrets_file(self._client_secrets_path, scopes=SCOPES, redirect_uri=redirect_uri)
+        flow = Flow.from_client_config(self._client_config, scopes=SCOPES, redirect_uri=redirect_uri)
         auth_url, _ = flow.authorization_url(
             access_type="offline",
-            prompt="consent",       # forces refresh_token to be returned every time
+            prompt="consent",
             state=state,
         )
         return auth_url
 
     def exchange_code(self, code: str, redirect_uri: str) -> str:
         """Exchange authorization code for credentials. Returns JSON string to store in DB."""
-        flow = Flow.from_client_secrets_file(self._client_secrets_path, scopes=SCOPES, redirect_uri=redirect_uri)
+        flow = Flow.from_client_config(self._client_config, scopes=SCOPES, redirect_uri=redirect_uri)
         flow.fetch_token(code=code)
         return self._credentials_to_json(flow.credentials)
 
