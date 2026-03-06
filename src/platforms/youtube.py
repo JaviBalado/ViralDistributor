@@ -20,13 +20,31 @@ class YouTubePublisher(BasePlatformPublisher):
     """
     YouTube publisher supporting web OAuth flow for server-side deployment.
     Each instance is tied to one account's credentials (stored as JSON in DB).
+
+    client_secrets can be provided as:
+    - A file at YOUTUBE_CLIENT_SECRETS_PATH (default: auth/client_secrets.json)
+    - OR the raw JSON string in YOUTUBE_CLIENT_SECRETS_JSON env var (easier for Coolify)
     """
 
     def __init__(self, credentials_json: str | None = None):
-        self._client_secrets_path = os.getenv("YOUTUBE_CLIENT_SECRETS_PATH", "auth/client_secrets.json")
+        self._client_secrets_path = self._resolve_client_secrets()
         self._credentials: Credentials | None = None
         if credentials_json:
             self._credentials = self._json_to_credentials(credentials_json)
+
+    def _resolve_client_secrets(self) -> str:
+        """
+        If YOUTUBE_CLIENT_SECRETS_JSON env var is set, write it to a temp file and return that path.
+        Otherwise use YOUTUBE_CLIENT_SECRETS_PATH (file on disk).
+        """
+        secrets_json = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON")
+        if secrets_json:
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+            tmp.write(secrets_json)
+            tmp.close()
+            return tmp.name
+        return os.getenv("YOUTUBE_CLIENT_SECRETS_PATH", "auth/client_secrets.json")
 
     # ------------------------------------------------------------------
     # Web OAuth flow (used by the dashboard to connect new accounts)
