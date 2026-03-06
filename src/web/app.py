@@ -7,9 +7,12 @@ import os
 import secrets
 import shutil
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from zoneinfo import ZoneInfo
+
+MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
@@ -241,7 +244,7 @@ async def upload_page(user: AuthDep, db: Session = Depends(get_db)):
         f'<option value="{a.id}">[{a.platform.upper()}] {a.name}</option>' for a in accounts
     )
 
-    now_local = datetime.utcnow().strftime("%Y-%m-%dT%H:%M")
+    now_local = datetime.now(MADRID_TZ).strftime("%Y-%m-%dT%H:%M")
 
     content = f"""
     <div class="page-header"><h2>Schedule Upload</h2></div>
@@ -321,9 +324,14 @@ async def schedule_upload(
     with open(dest, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Parse scheduled_at (browser sends local time in ISO format without timezone)
+    # Parse as Madrid time and convert to UTC for storage
     try:
-        scheduled_dt = datetime.fromisoformat(scheduled_at)
+        scheduled_dt = (
+            datetime.fromisoformat(scheduled_at)
+            .replace(tzinfo=MADRID_TZ)
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
     except ValueError:
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Invalid date format.")
@@ -352,33 +360,45 @@ async def posts_page(user: AuthDep, db: Session = Depends(get_db)):
         .all()
     )
 
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     rows = ""
     for p in posts:
         status_badge = _status_badge(p.status)
-        url_cell = f'<a href="{p.video_url}" target="_blank" class="link">View</a>' if p.video_url else (p.error_message or "—")
+        scheduled_madrid = _to_madrid(p.scheduled_at).strftime("%d/%m/%Y %H:%M")
+
+        if p.status == "pending":
+            extra_cell = f'<span style="color:#fbbf24;">{_countdown(p.scheduled_at, now_utc)}</span>'
+        elif p.status == "published" and p.video_url:
+            extra_cell = f'<a href="{p.video_url}" target="_blank" class="link">Ver vídeo</a>'
+        elif p.status == "failed" and p.error_message:
+            short = p.error_message[:60] + ("…" if len(p.error_message) > 60 else "")
+            extra_cell = f'<span style="color:#f87171;" title="{p.error_message}">{short}</span>'
+        else:
+            extra_cell = "—"
+
         rows += f"""
         <tr>
           <td>{p.id}</td>
           <td>{p.account.name if p.account else '—'}</td>
-          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{p.title}</td>
-          <td>{p.scheduled_at.strftime('%Y-%m-%d %H:%M')}</td>
+          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{p.title}</td>
+          <td style="white-space:nowrap;">{scheduled_madrid}</td>
           <td>{status_badge}</td>
-          <td style="font-size:.8rem;color:#888;">{url_cell}</td>
+          <td style="font-size:.82rem;max-width:220px;">{extra_cell}</td>
           <td>
-            <form method="post" action="/posts/{p.id}/delete" onsubmit="return confirm('Delete post?')">
-              <button class="btn-danger">Delete</button>
+            <form method="post" action="/posts/{p.id}/delete" onsubmit="return confirm('¿Eliminar post?')">
+              <button class="btn-danger">Eliminar</button>
             </form>
           </td>
         </tr>"""
 
     if not rows:
-        rows = '<tr><td colspan="7" style="text-align:center;color:#666;">No posts yet.</td></tr>'
+        rows = '<tr><td colspan="7" style="text-align:center;color:#666;">No hay posts todavía.</td></tr>'
 
     content = f"""
-    <div class="page-header"><h2>Scheduled Posts</h2></div>
+    <div class="page-header"><h2>Posts programados</h2><span style="color:#555;font-size:.8rem;">Horario: Madrid (Europe/Madrid)</span></div>
     <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>#</th><th>Account</th><th>Title</th><th>Scheduled</th><th>Status</th><th>Result</th><th>Actions</th></tr></thead>
+        <thead><tr><th>#</th><th>Cuenta</th><th>Título</th><th>Programado</th><th>Estado</th><th>Resultado / Tiempo restante</th><th>Acciones</th></tr></thead>
         <tbody>{rows}</tbody>
       </table>
     </div>"""
@@ -457,6 +477,30 @@ async def debug(user: AuthDep):
 # ------------------------------------------------------------------
 # HTML helpers
 # ------------------------------------------------------------------
+
+def _to_madrid(dt: datetime) -> datetime:
+    """Convert naive UTC datetime to Madrid time."""
+    return dt.replace(tzinfo=timezone.utc).astimezone(MADRID_TZ)
+
+
+def _countdown(scheduled_at: datetime, now_utc: datetime) -> str:
+    """Human-readable countdown from now until scheduled_at (both naive UTC)."""
+    diff = scheduled_at - now_utc
+    total = int(diff.total_seconds())
+    if total <= 0:
+        return "Publicando..."
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    minutes = (total % 3600) // 60
+    parts = []
+    if days:
+        parts.append(f"{days} día{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hora{'s' if hours != 1 else ''}")
+    if minutes and not days:
+        parts.append(f"{minutes} min")
+    return ", ".join(parts) or "Menos de 1 min"
+
 
 def _layout(title: str, content: str) -> str:
     return f"""<!DOCTYPE html>

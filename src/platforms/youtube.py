@@ -133,6 +133,11 @@ class YouTubePublisher(BasePlatformPublisher):
 
         media = MediaFileUpload(video.file_path, mimetype="video/*", resumable=True, chunksize=5 * 1024 * 1024)
 
+        if not os.path.exists(video.file_path):
+            msg = f"Video file not found: {video.file_path}"
+            logger.error(msg)
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=msg)
+
         try:
             request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
             response = None
@@ -147,8 +152,10 @@ class YouTubePublisher(BasePlatformPublisher):
             logger.info(f"Upload successful: {url}")
             return PublishResult(platform=Platform.YOUTUBE, success=True, video_id=video_id, video_url=url)
         except Exception as e:
-            logger.error(f"YouTube upload failed: {e}")
-            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=str(e))
+            import traceback
+            detail = str(e) or repr(e) or traceback.format_exc()
+            logger.error(f"YouTube upload failed: {detail}")
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=detail)
 
     def get_updated_credentials_json(self) -> str:
         """Call after publish() to persist a refreshed token back to the DB."""

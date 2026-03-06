@@ -15,6 +15,9 @@ sqlalchemy>=2.0.0
 # Scheduler
 apscheduler>=3.10.0
 
+# Timezone data (required for zoneinfo on Linux containers)
+tzdata>=2024.1
+
 # Environment
 python-dotenv>=1.0.0
 

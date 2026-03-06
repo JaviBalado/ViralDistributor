@@ -71,9 +71,11 @@ def _check_and_publish():
                     post.error_message = f"Platform '{account.platform}' not yet implemented."
 
             except Exception as e:
+                import traceback
+                detail = str(e) or repr(e) or traceback.format_exc()
                 post.status = "failed"
-                post.error_message = str(e)
-                logger.error(f"Exception publishing post #{post.id}: {e}")
+                post.error_message = detail
+                logger.error(f"Exception publishing post #{post.id}: {detail}")
 
             db.commit()
 
