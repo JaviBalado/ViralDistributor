@@ -12,6 +12,11 @@ client_secrets.json
 token.json
 credentials.json
 
+# Database
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
 # Video files
 videos/
 *.mp4

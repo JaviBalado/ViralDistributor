@@ -1,10 +1,9 @@
+import json
 import os
-import pickle
-from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -14,58 +13,61 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# YouTube Data API v3 — scope required for video uploads
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-
-YOUTUBE_API_SERVICE = "youtube"
-YOUTUBE_API_VERSION = "v3"
 
 
 class YouTubePublisher(BasePlatformPublisher):
     """
-    Publishes videos (Shorts and long-form) to YouTube via the Data API v3.
-
-    Authentication uses OAuth 2.0. On first run, a browser window opens to
-    authorize the app. The resulting token is saved to YOUTUBE_TOKEN_PATH
-    and reused (with automatic refresh) on subsequent runs.
+    YouTube publisher supporting web OAuth flow for server-side deployment.
+    Each instance is tied to one account's credentials (stored as JSON in DB).
     """
 
-    def __init__(self):
+    def __init__(self, credentials_json: str | None = None):
         self._client_secrets_path = os.getenv("YOUTUBE_CLIENT_SECRETS_PATH", "auth/client_secrets.json")
-        self._token_path = os.getenv("YOUTUBE_TOKEN_PATH", "auth/tokens/youtube_token.json")
-        self._default_privacy = os.getenv("YOUTUBE_DEFAULT_PRIVACY", "private")
-        self._default_category = os.getenv("YOUTUBE_DEFAULT_CATEGORY_ID", "22")
         self._credentials: Credentials | None = None
-        self._youtube = None
+        if credentials_json:
+            self._credentials = self._json_to_credentials(credentials_json)
+
+    # ------------------------------------------------------------------
+    # Web OAuth flow (used by the dashboard to connect new accounts)
+    # ------------------------------------------------------------------
+
+    def get_auth_url(self, redirect_uri: str, state: str) -> str:
+        """Generate Google consent screen URL. Redirect user here to authorize."""
+        flow = Flow.from_client_secrets_file(self._client_secrets_path, scopes=SCOPES, redirect_uri=redirect_uri)
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",       # forces refresh_token to be returned every time
+            state=state,
+        )
+        return auth_url
+
+    def exchange_code(self, code: str, redirect_uri: str) -> str:
+        """Exchange authorization code for credentials. Returns JSON string to store in DB."""
+        flow = Flow.from_client_secrets_file(self._client_secrets_path, scopes=SCOPES, redirect_uri=redirect_uri)
+        flow.fetch_token(code=code)
+        return self._credentials_to_json(flow.credentials)
 
     # ------------------------------------------------------------------
     # BasePlatformPublisher interface
     # ------------------------------------------------------------------
 
     def authenticate(self) -> None:
-        """Load saved token or run the OAuth consent screen flow."""
-        creds = self._load_saved_credentials()
-
-        if creds and creds.expired and creds.refresh_token:
-            logger.info("Refreshing expired YouTube token...")
-            creds.refresh(Request())
-        elif not creds or not creds.valid:
-            logger.info("No valid token found. Starting OAuth flow...")
-            creds = self._run_oauth_flow()
-
-        self._save_credentials(creds)
-        self._credentials = creds
-        self._youtube = build(YOUTUBE_API_SERVICE, YOUTUBE_API_VERSION, credentials=creds)
-        logger.info("YouTube authentication successful.")
+        if self._credentials and self._credentials.expired and self._credentials.refresh_token:
+            self._credentials.refresh(Request())
 
     def is_authenticated(self) -> bool:
-        return self._credentials is not None and self._credentials.valid
+        return self._credentials is not None and (
+            self._credentials.valid or bool(self._credentials.refresh_token)
+        )
 
     def publish(self, video: VideoPost) -> PublishResult:
         if not self.is_authenticated():
-            self.authenticate()
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message="Account not authenticated.")
 
-        logger.info(f"Uploading '{video.title}' to YouTube...")
+        self.authenticate()  # refresh token if expired
+
+        youtube = build("youtube", "v3", credentials=self._credentials)
 
         tags = list(video.tags)
         if video.is_short and "#Shorts" not in tags:
@@ -76,76 +78,58 @@ class YouTubePublisher(BasePlatformPublisher):
                 "title": video.title,
                 "description": video.description,
                 "tags": tags,
-                "categoryId": video.category_id or self._default_category,
+                "categoryId": video.category_id or "22",
             },
             "status": {
-                "privacyStatus": video.privacy.value or self._default_privacy,
+                "privacyStatus": "public",
                 "selfDeclaredMadeForKids": False,
             },
         }
 
-        media = MediaFileUpload(
-            video.file_path,
-            mimetype="video/*",
-            resumable=True,
-            chunksize=1024 * 1024 * 5,  # 5 MB chunks
-        )
+        media = MediaFileUpload(video.file_path, mimetype="video/*", resumable=True, chunksize=5 * 1024 * 1024)
 
         try:
-            request = self._youtube.videos().insert(
-                part=",".join(body.keys()),
-                body=body,
-                media_body=media,
-            )
-            response = self._execute_resumable_upload(request)
+            request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
+            response = None
+            while response is None:
+                _, response = request.next_chunk()
             video_id = response["id"]
-            video_url = f"https://www.youtube.com/shorts/{video_id}" if video.is_short else f"https://www.youtube.com/watch?v={video_id}"
-            logger.info(f"Upload successful: {video_url}")
-            return PublishResult(
-                platform=Platform.YOUTUBE,
-                success=True,
-                video_id=video_id,
-                video_url=video_url,
+            url = (
+                f"https://www.youtube.com/shorts/{video_id}"
+                if video.is_short
+                else f"https://www.youtube.com/watch?v={video_id}"
             )
+            logger.info(f"Upload successful: {url}")
+            return PublishResult(platform=Platform.YOUTUBE, success=True, video_id=video_id, video_url=url)
         except Exception as e:
             logger.error(f"YouTube upload failed: {e}")
-            return PublishResult(
-                platform=Platform.YOUTUBE,
-                success=False,
-                error_message=str(e),
-            )
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=str(e))
+
+    def get_updated_credentials_json(self) -> str:
+        """Call after publish() to persist a refreshed token back to the DB."""
+        return self._credentials_to_json(self._credentials)
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Helpers
     # ------------------------------------------------------------------
 
-    def _load_saved_credentials(self) -> Credentials | None:
-        token_path = Path(self._token_path)
-        if token_path.exists():
-            with open(token_path, "rb") as f:
-                return pickle.load(f)
-        return None
+    def _credentials_to_json(self, creds: Credentials) -> str:
+        return json.dumps({
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": list(creds.scopes) if creds.scopes else [],
+        })
 
-    def _save_credentials(self, creds: Credentials) -> None:
-        token_path = Path(self._token_path)
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(token_path, "wb") as f:
-            pickle.dump(creds, f)
-
-    def _run_oauth_flow(self) -> Credentials:
-        secrets_path = Path(self._client_secrets_path)
-        if not secrets_path.exists():
-            raise FileNotFoundError(
-                f"client_secrets.json not found at '{secrets_path}'. "
-                "Download it from Google Cloud Console and place it at that path."
-            )
-        flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
-        return flow.run_local_server(port=0)
-
-    def _execute_resumable_upload(self, request) -> dict:
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                logger.debug(f"Upload progress: {int(status.progress() * 100)}%")
-        return response
+    def _json_to_credentials(self, credentials_json: str) -> Credentials:
+        data = json.loads(credentials_json)
+        return Credentials(
+            token=data.get("token"),
+            refresh_token=data.get("refresh_token"),
+            token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=data.get("client_id"),
+            client_secret=data.get("client_secret"),
+            scopes=data.get("scopes"),
+        )

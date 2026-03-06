@@ -9,8 +9,14 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 
+# Database
+sqlalchemy>=2.0.0
+
+# Scheduler
+apscheduler>=3.10.0
+
 # Environment
 python-dotenv>=1.0.0
 
-# HTTP / utilities
+# HTTP
 requests>=2.31.0
