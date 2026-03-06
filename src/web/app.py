@@ -376,20 +376,25 @@ async def posts_page(user: AuthDep, db: Session = Depends(get_db)):
         else:
             extra_cell = "—"
 
-        reschedule_form = f"""
-        <form method="post" action="/posts/{p.id}/reschedule" style="display:inline-flex;gap:.4rem;align-items:center;margin-top:.4rem;">
-          <input type="datetime-local" name="scheduled_at" value="{_to_madrid(p.scheduled_at).strftime('%Y-%m-%dT%H:%M')}"
-            style="padding:.25rem .5rem;font-size:.75rem;background:#0f0f0f;border:1px solid #444;border-radius:4px;color:#e0e0e0;"/>
-          <button type="submit" class="btn" style="padding:.25rem .6rem;font-size:.75rem;">Reprogramar</button>
-        </form>"""
-
-        if p.status in ("failed", "pending"):
+        if p.status == "failed":
             actions = f"""
             <div style="display:flex;flex-direction:column;gap:.3rem;">
-              <form method="post" action="/posts/{p.id}/retry" style="display:inline;">
+              <form method="post" action="/posts/{p.id}/retry">
                 <button class="btn" style="padding:.3rem .7rem;font-size:.78rem;width:100%;">Reintentar ahora</button>
               </form>
-              {reschedule_form}
+              <form method="post" action="/posts/{p.id}/reschedule" style="display:flex;gap:.3rem;align-items:center;">
+                <input type="datetime-local" name="scheduled_at" value="{_to_madrid(p.scheduled_at).strftime('%Y-%m-%dT%H:%M')}"
+                  style="flex:1;padding:.25rem .4rem;font-size:.74rem;background:#0f0f0f;border:1px solid #444;border-radius:4px;color:#e0e0e0;"/>
+                <button type="submit" class="btn" style="padding:.25rem .55rem;font-size:.74rem;white-space:nowrap;">Reprogramar</button>
+              </form>
+              <form method="post" action="/posts/{p.id}/delete" onsubmit="return confirm('¿Eliminar post?')">
+                <button class="btn-danger" style="width:100%;">Eliminar</button>
+              </form>
+            </div>"""
+        elif p.status == "pending":
+            actions = f"""
+            <div style="display:flex;flex-direction:column;gap:.3rem;">
+              <button class="btn" disabled style="padding:.3rem .7rem;font-size:.78rem;width:100%;opacity:.35;cursor:not-allowed;">En cola...</button>
               <form method="post" action="/posts/{p.id}/delete" onsubmit="return confirm('¿Eliminar post?')">
                 <button class="btn-danger" style="width:100%;">Eliminar</button>
               </form>
