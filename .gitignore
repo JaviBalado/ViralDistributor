@@ -1,0 +1,66 @@
+# Environment variables — NEVER commit this file
+.env
+*.env
+.env.*
+!.env.example
+
+# OAuth tokens and credentials — NEVER commit these
+auth/tokens/*.json
+auth/tokens/*.pickle
+auth/*.json
+client_secrets.json
+token.json
+credentials.json
+
+# Video files
+videos/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Logs
+logs/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/

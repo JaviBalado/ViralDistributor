@@ -1,0 +1,14 @@
+.env
+auth/tokens/
+auth/*.json
+client_secrets.json
+token.json
+videos/
+logs/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md
