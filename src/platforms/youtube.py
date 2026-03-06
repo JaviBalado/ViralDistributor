@@ -5,6 +5,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
 from src.models.video import VideoPost, PublishResult, Platform
@@ -174,6 +175,14 @@ class YouTubePublisher(BasePlatformPublisher):
             )
             logger.info(f"[publish] Upload successful: {url}")
             return PublishResult(platform=Platform.YOUTUBE, success=True, video_id=video_id, video_url=url)
+        except HttpError as e:
+            try:
+                body = e.content.decode("utf-8") if isinstance(e.content, bytes) else str(e.content)
+            except Exception:
+                body = repr(e.content)
+            detail = f"YouTube API error HTTP {e.resp.status}: {body}"
+            logger.error(f"[publish] {detail}")
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=detail)
         except Exception as e:
             detail = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
             logger.error(f"[publish] Upload failed — {detail}")

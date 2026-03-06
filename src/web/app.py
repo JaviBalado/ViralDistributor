@@ -376,19 +376,39 @@ async def posts_page(user: AuthDep, db: Session = Depends(get_db)):
         else:
             extra_cell = "—"
 
+        reschedule_form = f"""
+        <form method="post" action="/posts/{p.id}/reschedule" style="display:inline-flex;gap:.4rem;align-items:center;margin-top:.4rem;">
+          <input type="datetime-local" name="scheduled_at" value="{_to_madrid(p.scheduled_at).strftime('%Y-%m-%dT%H:%M')}"
+            style="padding:.25rem .5rem;font-size:.75rem;background:#0f0f0f;border:1px solid #444;border-radius:4px;color:#e0e0e0;"/>
+          <button type="submit" class="btn" style="padding:.25rem .6rem;font-size:.75rem;">Reprogramar</button>
+        </form>"""
+
+        if p.status in ("failed", "pending"):
+            actions = f"""
+            <div style="display:flex;flex-direction:column;gap:.3rem;">
+              <form method="post" action="/posts/{p.id}/retry" style="display:inline;">
+                <button class="btn" style="padding:.3rem .7rem;font-size:.78rem;width:100%;">Reintentar ahora</button>
+              </form>
+              {reschedule_form}
+              <form method="post" action="/posts/{p.id}/delete" onsubmit="return confirm('¿Eliminar post?')">
+                <button class="btn-danger" style="width:100%;">Eliminar</button>
+              </form>
+            </div>"""
+        else:
+            actions = f"""
+            <form method="post" action="/posts/{p.id}/delete" onsubmit="return confirm('¿Eliminar post?')">
+              <button class="btn-danger">Eliminar</button>
+            </form>"""
+
         rows += f"""
         <tr>
           <td>{p.id}</td>
           <td>{p.account.name if p.account else '—'}</td>
-          <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{p.title}</td>
+          <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{p.title}</td>
           <td style="white-space:nowrap;">{scheduled_madrid}</td>
           <td>{status_badge}</td>
-          <td style="font-size:.82rem;max-width:220px;">{extra_cell}</td>
-          <td>
-            <form method="post" action="/posts/{p.id}/delete" onsubmit="return confirm('¿Eliminar post?')">
-              <button class="btn-danger">Eliminar</button>
-            </form>
-          </td>
+          <td style="font-size:.82rem;max-width:200px;">{extra_cell}</td>
+          <td style="min-width:160px;">{actions}</td>
         </tr>"""
 
     if not rows:
@@ -403,6 +423,51 @@ async def posts_page(user: AuthDep, db: Session = Depends(get_db)):
       </table>
     </div>"""
     return HTMLResponse(_layout("Posts", content))
+
+
+@app.post("/posts/{post_id}/retry")
+async def retry_post(post_id: int, user: AuthDep, db: Session = Depends(get_db)):
+    """Reset a failed post to pending so it publishes on the next scheduler tick."""
+    post = db.query(ScheduledPost).filter(ScheduledPost.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    post.status = "pending"
+    post.error_message = None
+    # Schedule 1 minute from now so the scheduler picks it up immediately
+    from datetime import timedelta
+    post.scheduled_at = now_utc + timedelta(minutes=1)
+    db.commit()
+    logger.info(f"Post #{post_id} reset to pending, scheduled for 1 min from now.")
+    return RedirectResponse(url="/posts", status_code=302)
+
+
+@app.post("/posts/{post_id}/reschedule")
+async def reschedule_post(
+    post_id: int,
+    user: AuthDep,
+    scheduled_at: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Reschedule a failed or pending post to a new date/time (Madrid timezone)."""
+    post = db.query(ScheduledPost).filter(ScheduledPost.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    try:
+        new_dt = (
+            datetime.fromisoformat(scheduled_at)
+            .replace(tzinfo=MADRID_TZ)
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format.")
+    post.scheduled_at = new_dt
+    post.status = "pending"
+    post.error_message = None
+    db.commit()
+    logger.info(f"Post #{post_id} rescheduled to {new_dt} UTC.")
+    return RedirectResponse(url="/posts", status_code=302)
 
 
 @app.post("/posts/{post_id}/delete")
