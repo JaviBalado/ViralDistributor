@@ -107,12 +107,37 @@ class YouTubePublisher(BasePlatformPublisher):
         )
 
     def publish(self, video: VideoPost) -> PublishResult:
+        import traceback
+
+        # Step 1 — check auth
+        logger.info(f"[publish] is_authenticated={self.is_authenticated()}, credentials={self._credentials is not None}")
         if not self.is_authenticated():
             return PublishResult(platform=Platform.YOUTUBE, success=False, error_message="Account not authenticated.")
 
-        self.authenticate()  # refresh token if expired
+        # Step 2 — refresh token if needed
+        try:
+            self.authenticate()
+            logger.info("[publish] authenticate() OK")
+        except Exception as e:
+            detail = f"Token refresh failed — {type(e).__name__}: {e!r}"
+            logger.error(detail)
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=detail)
 
-        youtube = build("youtube", "v3", credentials=self._credentials)
+        # Step 3 — check file exists
+        logger.info(f"[publish] file_path={video.file_path!r}, exists={os.path.exists(video.file_path)}")
+        if not os.path.exists(video.file_path):
+            msg = f"Video file not found at path: {video.file_path}"
+            logger.error(msg)
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=msg)
+
+        # Step 4 — build API client
+        try:
+            youtube = build("youtube", "v3", credentials=self._credentials)
+            logger.info("[publish] YouTube client built OK")
+        except Exception as e:
+            detail = f"Failed to build YouTube client — {type(e).__name__}: {e!r}"
+            logger.error(detail)
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=detail)
 
         tags = list(video.tags)
         if video.is_short and "#Shorts" not in tags:
@@ -131,31 +156,28 @@ class YouTubePublisher(BasePlatformPublisher):
             },
         }
 
-        media = MediaFileUpload(video.file_path, mimetype="video/*", resumable=True, chunksize=5 * 1024 * 1024)
-
-        if not os.path.exists(video.file_path):
-            msg = f"Video file not found: {video.file_path}"
-            logger.error(msg)
-            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=msg)
-
+        # Step 5 — upload
         try:
+            media = MediaFileUpload(video.file_path, mimetype="video/*", resumable=True, chunksize=5 * 1024 * 1024)
             request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
+            logger.info("[publish] Starting chunked upload...")
             response = None
             while response is None:
-                _, response = request.next_chunk()
+                status, response = request.next_chunk()
+                if status:
+                    logger.info(f"[publish] Upload progress: {int(status.progress() * 100)}%")
             video_id = response["id"]
             url = (
                 f"https://www.youtube.com/shorts/{video_id}"
                 if video.is_short
                 else f"https://www.youtube.com/watch?v={video_id}"
             )
-            logger.info(f"Upload successful: {url}")
+            logger.info(f"[publish] Upload successful: {url}")
             return PublishResult(platform=Platform.YOUTUBE, success=True, video_id=video_id, video_url=url)
         except Exception as e:
-            import traceback
-            detail = str(e) or repr(e) or traceback.format_exc()
-            logger.error(f"YouTube upload failed: {detail}")
-            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=detail)
+            detail = f"{type(e).__name__}: {e!r}\n{traceback.format_exc()}"
+            logger.error(f"[publish] Upload failed — {detail}")
+            return PublishResult(platform=Platform.YOUTUBE, success=False, error_message=f"{type(e).__name__}: {e!r}")
 
     def get_updated_credentials_json(self) -> str:
         """Call after publish() to persist a refreshed token back to the DB."""
