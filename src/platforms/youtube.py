@@ -71,19 +71,25 @@ class YouTubePublisher(BasePlatformPublisher):
     # Web OAuth flow (used by the dashboard to connect new accounts)
     # ------------------------------------------------------------------
 
-    def get_auth_url(self, redirect_uri: str, state: str) -> str:
-        """Generate Google consent screen URL. Redirect user here to authorize."""
+    def get_auth_url(self, redirect_uri: str, state: str) -> tuple[str, str | None]:
+        """
+        Generate Google consent screen URL.
+        Returns (auth_url, code_verifier). Store code_verifier and pass it to exchange_code().
+        """
         flow = Flow.from_client_config(self._client_config, scopes=SCOPES, redirect_uri=redirect_uri)
         auth_url, _ = flow.authorization_url(
             access_type="offline",
             prompt="consent",
             state=state,
         )
-        return auth_url
+        # code_verifier is set automatically by the library (PKCE); must be preserved for token exchange
+        return auth_url, getattr(flow, "code_verifier", None)
 
-    def exchange_code(self, code: str, redirect_uri: str) -> str:
+    def exchange_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> str:
         """Exchange authorization code for credentials. Returns JSON string to store in DB."""
         flow = Flow.from_client_config(self._client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+        if code_verifier:
+            flow.code_verifier = code_verifier
         flow.fetch_token(code=code)
         return self._credentials_to_json(flow.credentials)
 

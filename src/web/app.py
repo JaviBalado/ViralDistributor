@@ -153,7 +153,8 @@ async def connect_youtube_start(user: AuthDep, account_name: str = Form(...)):
     _oauth_states[state] = {"account_name": account_name, "platform": "youtube"}
     try:
         publisher = YouTubePublisher()
-        auth_url = publisher.get_auth_url(redirect_uri=OAUTH_REDIRECT_URI, state=state)
+        auth_url, code_verifier = publisher.get_auth_url(redirect_uri=OAUTH_REDIRECT_URI, state=state)
+        _oauth_states[state]["code_verifier"] = code_verifier
     except (FileNotFoundError, ValueError) as e:
         return HTMLResponse(_layout("Error", f"""
         <div class="page-header"><h2>Configuration Error</h2></div>
@@ -193,7 +194,11 @@ async def youtube_callback(request: Request, db: Session = Depends(get_db)):
     publisher = YouTubePublisher()
 
     try:
-        credentials_json = publisher.exchange_code(code=code, redirect_uri=OAUTH_REDIRECT_URI)
+        credentials_json = publisher.exchange_code(
+            code=code,
+            redirect_uri=OAUTH_REDIRECT_URI,
+            code_verifier=state_data.get("code_verifier"),
+        )
     except Exception as e:
         logger.error(f"OAuth exchange failed: {e}")
         raise HTTPException(status_code=500, detail=f"Token exchange failed: {e}")
