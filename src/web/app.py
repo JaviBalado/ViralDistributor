@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db, init_db
@@ -493,6 +494,174 @@ async def health():
     return {"status": "ok"}
 
 
+# ------------------------------------------------------------------
+# Queue import (from TikTok Studio / external JSON)
+# ------------------------------------------------------------------
+
+class QueuePostItem(BaseModel):
+    file_path: str
+    title: str
+    description: str = ""
+    tags: str = ""               # comma-separated
+    publish_date: str = ""       # ISO 8601, e.g. "2026-03-15T18:00:00"
+
+
+class QueueImportPayload(BaseModel):
+    account_id: int
+    posts: list[QueuePostItem]
+
+
+@app.get("/queue/import-ui", response_class=HTMLResponse)
+async def import_queue_page(user: AuthDep, db: Session = Depends(get_db)):
+    accounts = db.query(Account).order_by(Account.name).all()
+    account_options = "".join(
+        f'<option value="{a.id}">[{a.platform.upper()}] {a.name}</option>' for a in accounts
+    ) or '<option value="">— No accounts connected —</option>'
+
+    content = f"""
+    <div class="page-header"><h2>Import Queue — TikTok Studio JSON</h2></div>
+    <div class="card" style="max-width:680px;">
+      <p style="color:#888;font-size:.85rem;margin-bottom:1rem;">
+        Pega aquí el JSON generado por TikTok Studio (botón "Exportar a Viral Distributor")
+        o envíalo directamente via <code>POST /api/queue/import</code>.
+      </p>
+
+      <label>Cuenta de destino</label>
+      <select id="accountId">{account_options}</select>
+
+      <label>JSON de cola</label>
+      <textarea id="queueJson" style="min-height:220px;font-family:monospace;font-size:.8rem;"
+        placeholder='{{"account_id": null, "posts": [{{"file_path": "/ruta/video.mp4", "title": "Mi Short", "description": "#shorts", "tags": "shorts,viral", "publish_date": "2026-03-15T18:00:00"}}]}}'></textarea>
+
+      <button class="btn" style="margin-top:1rem;width:100%;" onclick="importQueue()">Importar cola</button>
+      <div id="result" style="display:none;margin-top:1rem;padding:.75rem;border-radius:6px;"></div>
+    </div>
+    <div class="card" style="max-width:680px;margin-top:1.5rem;">
+      <p style="color:#888;font-size:.8rem;font-weight:600;margin-bottom:.5rem;">Formato JSON esperado:</p>
+      <pre style="background:#0f0f0f;padding:1rem;border-radius:6px;color:#fbbf24;font-size:.75rem;overflow-x:auto;">{{"account_id": null,
+  "posts": [
+    {{
+      "file_path": "/ruta/absoluta/video.mp4",
+      "title": "Título del short #shorts",
+      "description": "Descripción del vídeo",
+      "tags": "shorts,viral,tema",
+      "publish_date": "2026-03-15T18:00:00"
+    }}
+  ]}}</pre>
+      <p style="color:#555;font-size:.75rem;margin-top:.5rem;">
+        <strong style="color:#888;">publish_date</strong>: hora de Madrid (Europe/Madrid). Si se omite, se publica en 1 minuto.<br>
+        <strong style="color:#888;">account_id</strong>: se sobreescribe con la cuenta seleccionada arriba.
+      </p>
+    </div>
+    <script>
+    async function importQueue() {{
+      const r = document.getElementById('result');
+      r.style.display='none';
+      let raw;
+      try {{ raw = JSON.parse(document.getElementById('queueJson').value); }}
+      catch(e) {{ r.style.cssText='display:block;background:#2b0d0d;border:1px solid #7a1a1a;color:#f87171;padding:.75rem;border-radius:6px;'; r.textContent='JSON inválido: '+e.message; return; }}
+      raw.account_id = parseInt(document.getElementById('accountId').value);
+      try {{
+        const res = await fetch('/api/queue/import', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(raw)}});
+        const data = await res.json();
+        r.style.display='block';
+        if (res.ok) {{
+          r.style.cssText='display:block;background:#0d2b1a;border:1px solid #1a7a3a;color:#4ade80;padding:.75rem;border-radius:6px;';
+          r.textContent = data.message + ' IDs: ' + (data.post_ids||[]).join(', ');
+        }} else {{
+          r.style.cssText='display:block;background:#2b0d0d;border:1px solid #7a1a1a;color:#f87171;padding:.75rem;border-radius:6px;';
+          r.textContent='Error: '+(data.detail||JSON.stringify(data));
+        }}
+      }} catch(err) {{
+        r.style.cssText='display:block;background:#2b0d0d;border:1px solid #7a1a1a;color:#f87171;padding:.75rem;border-radius:6px;';
+        r.textContent='Network error: '+err.message;
+      }}
+    }}
+    </script>
+    """
+    return HTMLResponse(_layout("Import Queue", content))
+
+
+@app.post("/api/queue/import")
+async def import_queue(
+    payload: QueueImportPayload,
+    user: AuthDep,
+    db: Session = Depends(get_db),
+):
+    """
+    Importa una cola de vídeos ya generados (p.ej. desde TikTok Studio).
+
+    Formato JSON:
+    {
+      "account_id": 1,
+      "posts": [
+        {
+          "file_path": "/absolute/path/video.mp4",
+          "title": "Mi Short #1",
+          "description": "Descripción #shorts",
+          "tags": "shorts,viral,tema",
+          "publish_date": "2026-03-15T18:00:00"
+        }
+      ]
+    }
+
+    - publish_date se interpreta en hora de Madrid (Europe/Madrid).
+    - Si publish_date está vacío, se programa para ahora + 1 minuto.
+    - Devuelve la lista de IDs de posts creados.
+    """
+    account = db.query(Account).filter(Account.id == payload.account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail=f"Account #{payload.account_id} not found.")
+
+    from datetime import timedelta
+    created_ids = []
+    errors = []
+
+    for item in payload.posts:
+        # Validar que el fichero existe
+        if not Path(item.file_path).is_file():
+            errors.append({"file_path": item.file_path, "error": "File not found"})
+            continue
+
+        # Parsear fecha
+        if item.publish_date:
+            try:
+                scheduled_dt = (
+                    datetime.fromisoformat(item.publish_date)
+                    .replace(tzinfo=MADRID_TZ)
+                    .astimezone(timezone.utc)
+                    .replace(tzinfo=None)
+                )
+            except ValueError:
+                errors.append({"file_path": item.file_path, "error": f"Invalid publish_date: {item.publish_date}"})
+                continue
+        else:
+            scheduled_dt = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=1)
+
+        post = ScheduledPost(
+            account_id=payload.account_id,
+            title=item.title,
+            description=item.description,
+            tags=item.tags,
+            file_path=str(Path(item.file_path).absolute()),
+            scheduled_at=scheduled_dt,
+        )
+        db.add(post)
+        db.flush()
+        created_ids.append(post.id)
+
+    db.commit()
+    logger.info(f"Queue import: {len(created_ids)} posts created, {len(errors)} errors. Account #{payload.account_id}")
+
+    return JSONResponse({
+        "success": True,
+        "created": len(created_ids),
+        "post_ids": created_ids,
+        "errors": errors,
+        "message": f"{len(created_ids)} vídeos programados, {len(errors)} errores.",
+    })
+
+
 @app.get("/debug", response_class=HTMLResponse)
 async def debug(user: AuthDep):
     """Shows configuration status to help diagnose issues."""
@@ -648,6 +817,7 @@ def _layout(title: str, content: str) -> str:
     <a href="/accounts" {"class='active'" if title in ("Accounts","Connect YouTube") else ""}>Accounts</a>
     <a href="/upload" {"class='active'" if title == "Upload" else ""}>Schedule Upload</a>
     <a href="/posts" {"class='active'" if title == "Posts" else ""}>Scheduled Posts</a>
+    <a href="/queue/import-ui" {"class='active'" if title == "Import Queue" else ""}>Import Queue (JSON)</a>
     <div class="nav-section" style="margin-top:auto;">Platforms</div>
     <a style="opacity:.4;pointer-events:none;">Instagram (Phase 2)</a>
     <a style="opacity:.4;pointer-events:none;">TikTok (Phase 3)</a>
