@@ -494,6 +494,17 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/accounts")
+async def api_list_accounts(user: AuthDep, db: Session = Depends(get_db)):
+    """Devuelve las cuentas conectadas en formato JSON (para clientes externos)."""
+    accounts = db.query(Account).order_by(Account.name).all()
+    return [
+        {"id": a.id, "name": a.name, "platform": a.platform,
+         "created_at": a.created_at.isoformat()}
+        for a in accounts
+    ]
+
+
 # ------------------------------------------------------------------
 # Queue import (from TikTok Studio / external JSON)
 # ------------------------------------------------------------------
