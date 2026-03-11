@@ -11,6 +11,8 @@ class Account(Base):
     name = Column(String(100), nullable=False)           # User-given label, e.g. "Gaming Channel"
     platform = Column(String(20), nullable=False)        # youtube | instagram | tiktok
     credentials_json = Column(Text, nullable=True)       # Serialized OAuth token (JSON)
+    channel_id = Column(String(50), nullable=True)       # YouTube channel ID
+    channel_thumbnail_url = Column(Text, nullable=True)  # YouTube channel profile picture URL
     created_at = Column(DateTime, default=datetime.utcnow)
 
     posts = relationship("ScheduledPost", back_populates="account", cascade="all, delete")

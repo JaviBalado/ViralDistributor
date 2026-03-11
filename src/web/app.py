@@ -3,6 +3,7 @@ ViralDistributor — Web Dashboard
 Multi-account, multi-platform video scheduler with OAuth web flow.
 Protected by HTTP Basic Auth via environment variables.
 """
+import html as html_lib
 import os
 import secrets
 import shutil
@@ -10,12 +11,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -98,10 +100,22 @@ async def accounts_page(user: AuthDep, db: Session = Depends(get_db)):
     rows = ""
     for acc in accounts:
         platform_badge = _platform_badge(acc.platform)
+        if acc.channel_thumbnail_url:
+            thumb = f'<img src="{html_lib.escape(acc.channel_thumbnail_url)}" width="36" height="36" style="border-radius:50%;flex-shrink:0;" />'
+        else:
+            thumb = '<div style="width:36px;height:36px;border-radius:50%;background:#222;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:.7rem;color:#555;">?</div>'
         rows += f"""
         <tr>
           <td>{acc.id}</td>
-          <td>{platform_badge} {acc.name}</td>
+          <td>
+            <div style="display:flex;align-items:center;gap:.6rem;">
+              {thumb}
+              <div>
+                <div>{platform_badge} {html_lib.escape(acc.name)}</div>
+                {'<div style="font-size:.72rem;color:#555;">'+html_lib.escape(acc.channel_id)+'</div>' if acc.channel_id else ''}
+              </div>
+            </div>
+          </td>
           <td>{acc.created_at.strftime('%Y-%m-%d %H:%M')}</td>
           <td>
             <form method="post" action="/accounts/{acc.id}/delete" onsubmit="return confirm('Delete account?')">
@@ -216,6 +230,18 @@ async def youtube_callback(request: Request, db: Session = Depends(get_db)):
     db.commit()
     logger.info(f"New account connected: {account.name} ({account.platform})")
 
+    # Fetch channel info (thumbnail, channel ID)
+    try:
+        channel_publisher = YouTubePublisher(credentials_json=credentials_json)
+        channel_info = channel_publisher.get_channel_info()
+        if channel_info:
+            account.channel_id = channel_info["channel_id"]
+            account.channel_thumbnail_url = channel_info["thumbnail_url"]
+            db.commit()
+            logger.info(f"Channel info saved for account #{account.id}: {channel_info['channel_id']}")
+    except Exception as e:
+        logger.warning(f"Could not fetch channel info for account #{account.id}: {e}")
+
     return RedirectResponse(url="/accounts", status_code=302)
 
 
@@ -242,7 +268,7 @@ async def upload_page(user: AuthDep, db: Session = Depends(get_db)):
         return HTMLResponse(_layout("Upload", content))
 
     account_options = "".join(
-        f'<option value="{a.id}">[{a.platform.upper()}] {a.name}</option>' for a in accounts
+        f'<option value="{a.id}">[{a.platform.upper()}] {html_lib.escape(a.name)}</option>' for a in accounts
     )
 
     now_local = datetime.now(MADRID_TZ).strftime("%Y-%m-%dT%H:%M")
@@ -318,14 +344,12 @@ async def schedule_upload(
     if not account:
         raise HTTPException(status_code=404, detail="Account not found.")
 
-    # Save video file with unique name to avoid collisions
     ext = Path(file.filename).suffix
     unique_name = f"{uuid.uuid4().hex}{ext}"
     dest = UPLOAD_DIR / unique_name
     with open(dest, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Parse as Madrid time and convert to UTC for storage
     try:
         scheduled_dt = (
             datetime.fromisoformat(scheduled_at)
@@ -353,19 +377,45 @@ async def schedule_upload(
 
 
 @app.get("/posts", response_class=HTMLResponse)
-async def posts_page(user: AuthDep, db: Session = Depends(get_db)):
-    posts = (
-        db.query(ScheduledPost)
-        .order_by(ScheduledPost.scheduled_at.desc())
-        .limit(100)
-        .all()
-    )
+async def posts_page(user: AuthDep, db: Session = Depends(get_db), channel: int = Query(None)):
+    all_accounts = db.query(Account).order_by(Account.name).all()
+
+    query = db.query(ScheduledPost).order_by(ScheduledPost.scheduled_at.desc())
+    if channel:
+        query = query.filter(ScheduledPost.account_id == channel)
+    posts = query.limit(200).all()
 
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Channel filter dropdown
+    channel_opts = '<option value="">Todos los canales</option>'
+    for a in all_accounts:
+        sel = 'selected' if channel == a.id else ''
+        channel_opts += f'<option value="{a.id}" {sel}>{html_lib.escape(a.name)}</option>'
+
+    # Bulk move account options
+    bulk_account_opts = '<option value="">Mover a canal...</option>'
+    for a in all_accounts:
+        bulk_account_opts += f'<option value="{a.id}">{html_lib.escape(a.name)}</option>'
+
+    # Accounts JSON for modal dropdown
+    import json as _json
+    accounts_json = _json.dumps([
+        {"id": a.id, "name": a.name, "platform": a.platform}
+        for a in all_accounts
+    ])
+
     rows = ""
     for p in posts:
         status_badge = _status_badge(p.status)
         scheduled_madrid = _to_madrid(p.scheduled_at).strftime("%d/%m/%Y %H:%M")
+        account_name = p.account.name if p.account else "—"
+        account_thumb = p.account.channel_thumbnail_url if p.account else None
+
+        if account_thumb:
+            account_cell = f'<div style="display:flex;align-items:center;gap:.4rem;"><img src="{html_lib.escape(account_thumb)}" width="22" height="22" style="border-radius:50%;flex-shrink:0;" /><span>{html_lib.escape(account_name)}</span></div>'
+        else:
+            account_cell = html_lib.escape(account_name)
 
         if p.status == "pending":
             extra_cell = f'<span style="color:#fbbf24;">{_countdown(p.scheduled_at, now_utc)}</span>'
@@ -373,9 +423,13 @@ async def posts_page(user: AuthDep, db: Session = Depends(get_db)):
             extra_cell = f'<a href="{p.video_url}" target="_blank" class="link">Ver vídeo</a>'
         elif p.status == "failed" and p.error_message:
             short = p.error_message[:60] + ("…" if len(p.error_message) > 60 else "")
-            extra_cell = f'<span style="color:#f87171;" title="{p.error_message}">{short}</span>'
+            extra_cell = f'<span style="color:#f87171;" title="{html_lib.escape(p.error_message)}">{html_lib.escape(short)}</span>'
         else:
             extra_cell = "—"
+
+        checkbox_cell = ""
+        if p.status == "pending":
+            checkbox_cell = f'<input type="checkbox" class="post-checkbox" data-post-id="{p.id}" onclick="event.stopPropagation();updateBulkControls();" style="width:16px;height:16px;cursor:pointer;" />'
 
         if p.status == "failed":
             actions = f"""
@@ -407,41 +461,327 @@ async def posts_page(user: AuthDep, db: Session = Depends(get_db)):
             </form>"""
 
         rows += f"""
-        <tr>
+        <tr data-post-id="{p.id}" style="cursor:pointer;" title="Click para ver/editar detalles">
+          <td style="width:32px;" onclick="event.stopPropagation();">{checkbox_cell}</td>
           <td>{p.id}</td>
-          <td>{p.account.name if p.account else '—'}</td>
-          <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{p.title}</td>
+          <td>{account_cell}</td>
+          <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{html_lib.escape(p.title)}</td>
           <td style="white-space:nowrap;">{scheduled_madrid}</td>
           <td>{status_badge}</td>
           <td style="font-size:.82rem;max-width:200px;">{extra_cell}</td>
-          <td style="min-width:160px;">{actions}</td>
+          <td style="min-width:160px;" onclick="event.stopPropagation();">{actions}</td>
         </tr>"""
 
     if not rows:
-        rows = '<tr><td colspan="7" style="text-align:center;color:#666;">No hay posts todavía.</td></tr>'
+        rows = '<tr><td colspan="8" style="text-align:center;color:#666;">No hay posts todavía.</td></tr>'
 
     content = f"""
-    <div class="page-header"><h2>Posts programados</h2><span style="color:#555;font-size:.8rem;">Horario: Madrid (Europe/Madrid)</span></div>
+    <div class="page-header">
+      <h2>Posts programados</h2>
+      <div style="display:flex;gap:.75rem;align-items:center;">
+        <span style="color:#555;font-size:.8rem;">Horario: Madrid (Europe/Madrid)</span>
+        <form method="get" action="/posts" style="display:flex;gap:.4rem;align-items:center;">
+          <select name="channel" onchange="this.form.submit()" style="padding:.3rem .6rem;font-size:.82rem;background:#0f0f0f;border:1px solid #333;border-radius:5px;color:#e0e0e0;">
+            {channel_opts}
+          </select>
+          {"<button type='submit' class='btn' style='padding:.3rem .6rem;font-size:.78rem;'>Filtrar</button>" if not channel else '<a href="/posts" style="font-size:.78rem;color:#888;padding:.3rem .5rem;border:1px solid #333;border-radius:5px;">✕ Todos</a>'}
+        </form>
+      </div>
+    </div>
+
+    <div id="bulkBar" style="display:none;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:.6rem 1rem;margin-bottom:1rem;display:none;align-items:center;gap:.75rem;flex-wrap:wrap;">
+      <span id="bulkCount" style="color:#888;font-size:.83rem;">0 seleccionados</span>
+      <select id="bulkTarget" style="padding:.3rem .6rem;font-size:.82rem;background:#0f0f0f;border:1px solid #333;border-radius:5px;color:#e0e0e0;">
+        {bulk_account_opts}
+      </select>
+      <button class="btn" style="padding:.35rem .8rem;font-size:.8rem;" onclick="doBulkMove()">Mover canal</button>
+      <button class="btn-danger" style="padding:.35rem .8rem;font-size:.78rem;" onclick="clearSelection()">Cancelar</button>
+    </div>
+
     <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>#</th><th>Cuenta</th><th>Título</th><th>Programado</th><th>Estado</th><th>Resultado / Tiempo restante</th><th>Acciones</th></tr></thead>
-        <tbody>{rows}</tbody>
+        <thead>
+          <tr>
+            <th style="width:32px;"><input type="checkbox" id="selectAll" onchange="toggleAll(this)" style="width:16px;height:16px;cursor:pointer;" /></th>
+            <th>#</th><th>Cuenta</th><th>Título</th><th>Programado</th><th>Estado</th><th>Resultado / Tiempo restante</th><th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody id="postsTable">{rows}</tbody>
       </table>
-    </div>"""
+    </div>
+
+    <!-- Detail / Edit Modal -->
+    <div id="postModal" onclick="if(event.target===this)closeModal()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:999;overflow-y:auto;padding:1.5rem;">
+      <div style="max-width:640px;margin:0 auto;background:#141414;border:1px solid #333;border-radius:12px;padding:1.5rem;position:relative;">
+        <button onclick="closeModal()" style="position:absolute;top:.75rem;right:.75rem;background:none;border:none;color:#666;font-size:1.2rem;cursor:pointer;line-height:1;">✕</button>
+
+        <h3 style="font-size:1.1rem;color:#f0f0f0;margin-bottom:1.25rem;" id="modalTitle">Detalles del post</h3>
+
+        <!-- Thumbnail -->
+        <div id="modalThumb" style="margin-bottom:1rem;display:none;">
+          <img id="modalThumbImg" src="" alt="thumbnail" style="width:100%;max-height:180px;object-fit:cover;border-radius:8px;border:1px solid #222;" />
+        </div>
+
+        <!-- Status info -->
+        <div id="modalStatusRow" style="margin-bottom:1rem;display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;">
+          <span id="modalStatusBadge"></span>
+          <a id="modalVideoLink" href="#" target="_blank" class="link" style="display:none;font-size:.82rem;">Ver en YouTube</a>
+          <span id="modalErrorMsg" style="color:#f87171;font-size:.8rem;display:none;"></span>
+        </div>
+
+        <div style="display:grid;gap:.1rem;">
+          <label>Título</label>
+          <input type="text" id="modalTitleInput" maxlength="100" style="font-size:.9rem;" />
+
+          <label style="margin-top:.6rem;">Canal / Cuenta</label>
+          <select id="modalAccount" style="font-size:.88rem;"></select>
+
+          <label style="margin-top:.6rem;" id="modalDateLabel">Fecha programada (Madrid)</label>
+          <input type="datetime-local" id="modalDate" style="font-size:.88rem;" />
+
+          <label style="margin-top:.6rem;">Descripción</label>
+          <textarea id="modalDesc" style="min-height:90px;font-size:.85rem;"></textarea>
+
+          <label style="margin-top:.6rem;">Tags (separados por coma)</label>
+          <input type="text" id="modalTags" style="font-size:.88rem;" />
+        </div>
+
+        <div id="modalSaveResult" style="display:none;margin-top:.75rem;padding:.6rem;border-radius:6px;font-size:.83rem;"></div>
+
+        <div style="display:flex;gap:.6rem;margin-top:1.1rem;">
+          <button class="btn" id="modalSaveBtn" onclick="savePost()" style="flex:1;">Guardar cambios</button>
+          <button onclick="closeModal()" style="padding:.5rem 1rem;background:#1a1a1a;border:1px solid #333;border-radius:6px;color:#888;cursor:pointer;font-size:.88rem;">Cancelar</button>
+        </div>
+        <p id="modalSaveNote" style="margin-top:.5rem;font-size:.73rem;color:#555;"></p>
+      </div>
+    </div>
+
+    <input type="hidden" id="currentPostId" value="" />
+
+    <script>
+    const ACCOUNTS = {accounts_json};
+    let currentPostId = null;
+
+    // ── Row click → open modal ──────────────────────────────────
+    document.querySelectorAll('tr[data-post-id]').forEach(row => {{
+      row.addEventListener('click', e => {{
+        if (e.target.closest('button,form,input,a,select')) return;
+        openModal(row.dataset.postId);
+      }});
+    }});
+
+    async function openModal(postId) {{
+      currentPostId = postId;
+      const modal = document.getElementById('postModal');
+      modal.style.display = 'block';
+      document.getElementById('modalSaveResult').style.display = 'none';
+      document.getElementById('modalTitle').textContent = 'Cargando...';
+
+      try {{
+        const res = await fetch('/api/posts/' + postId);
+        if (!res.ok) throw new Error('Error al cargar post');
+        const d = await res.json();
+
+        document.getElementById('modalTitle').textContent = 'Post #' + d.id;
+
+        // Thumbnail (YouTube)
+        const vid = extractVideoId(d.video_url);
+        const thumbDiv = document.getElementById('modalThumb');
+        if (vid) {{
+          document.getElementById('modalThumbImg').src = 'https://img.youtube.com/vi/' + vid + '/mqdefault.jpg';
+          thumbDiv.style.display = 'block';
+        }} else {{
+          thumbDiv.style.display = 'none';
+        }}
+
+        // Status
+        const statusBadges = {{
+          pending: '<span class="badge badge-pending">Pending</span>',
+          published: '<span class="badge badge-published">Published</span>',
+          failed: '<span class="badge badge-failed">Failed</span>'
+        }};
+        document.getElementById('modalStatusBadge').innerHTML = statusBadges[d.status] || d.status;
+
+        const videoLink = document.getElementById('modalVideoLink');
+        if (d.video_url) {{
+          videoLink.href = d.video_url; videoLink.style.display = 'inline';
+        }} else {{ videoLink.style.display = 'none'; }}
+
+        const errEl = document.getElementById('modalErrorMsg');
+        if (d.error_message) {{
+          errEl.textContent = d.error_message; errEl.style.display = 'inline';
+        }} else {{ errEl.style.display = 'none'; }}
+
+        // Fields
+        document.getElementById('modalTitleInput').value = d.title || '';
+        document.getElementById('modalDesc').value = d.description || '';
+        document.getElementById('modalTags').value = d.tags || '';
+        document.getElementById('modalDate').value = d.scheduled_at || '';
+
+        // Account dropdown
+        const accSel = document.getElementById('modalAccount');
+        accSel.innerHTML = '';
+        ACCOUNTS.forEach(a => {{
+          const opt = document.createElement('option');
+          opt.value = a.id;
+          opt.textContent = '[' + a.platform.toUpperCase() + '] ' + a.name;
+          if (a.id === d.account_id) opt.selected = true;
+          accSel.appendChild(opt);
+        }});
+
+        // Read-only state
+        const isPending = d.status === 'pending' || d.status === 'failed';
+        document.getElementById('modalDate').disabled = !isPending;
+        document.getElementById('modalDateLabel').style.color = isPending ? '#888' : '#444';
+        accSel.disabled = !isPending;
+
+        // Save note
+        const note = document.getElementById('modalSaveNote');
+        if (d.status === 'published') {{
+          note.textContent = 'El post está publicado — guardar intentará actualizar el título, descripción y tags en YouTube.';
+        }} else {{
+          note.textContent = '';
+        }}
+
+        document.getElementById('modalSaveBtn').textContent = d.status === 'published' ? 'Guardar y actualizar en YouTube' : 'Guardar cambios';
+
+      }} catch(e) {{
+        document.getElementById('modalTitle').textContent = 'Error: ' + e.message;
+      }}
+    }}
+
+    function closeModal() {{
+      document.getElementById('postModal').style.display = 'none';
+      currentPostId = null;
+    }}
+
+    async function savePost() {{
+      if (!currentPostId) return;
+      const btn = document.getElementById('modalSaveBtn');
+      const resultEl = document.getElementById('modalSaveResult');
+      btn.disabled = true; btn.textContent = 'Guardando...';
+      resultEl.style.display = 'none';
+
+      const payload = {{
+        title: document.getElementById('modalTitleInput').value,
+        description: document.getElementById('modalDesc').value,
+        tags: document.getElementById('modalTags').value,
+        scheduled_at: document.getElementById('modalDate').value,
+        account_id: parseInt(document.getElementById('modalAccount').value),
+      }};
+
+      try {{
+        const res = await fetch('/api/posts/' + currentPostId + '/update', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(payload),
+        }});
+        const data = await res.json();
+        resultEl.style.display = 'block';
+        if (res.ok) {{
+          if (data.updated_on_youtube) {{
+            resultEl.style.cssText = 'display:block;background:#0d2b1a;border:1px solid #1a7a3a;color:#4ade80;padding:.6rem;border-radius:6px;font-size:.83rem;';
+            resultEl.textContent = '✓ Guardado y actualizado en YouTube.';
+          }} else if (data.youtube_error) {{
+            resultEl.style.cssText = 'display:block;background:#1a1500;border:1px solid #4a3800;color:#fbbf24;padding:.6rem;border-radius:6px;font-size:.83rem;';
+            resultEl.textContent = '✓ Guardado localmente. YouTube: ' + data.youtube_error;
+          }} else {{
+            resultEl.style.cssText = 'display:block;background:#0d2b1a;border:1px solid #1a7a3a;color:#4ade80;padding:.6rem;border-radius:6px;font-size:.83rem;';
+            resultEl.textContent = '✓ Cambios guardados.';
+          }}
+          // Update the row title in the table
+          const row = document.querySelector('tr[data-post-id="' + currentPostId + '"]');
+          if (row) {{
+            const titleTd = row.cells[3];
+            if (titleTd) titleTd.textContent = payload.title;
+          }}
+          setTimeout(() => closeModal(), 1500);
+        }} else {{
+          resultEl.style.cssText = 'display:block;background:#2b0d0d;border:1px solid #7a1a1a;color:#f87171;padding:.6rem;border-radius:6px;font-size:.83rem;';
+          resultEl.textContent = 'Error: ' + (data.detail || JSON.stringify(data));
+        }}
+      }} catch(err) {{
+        resultEl.style.cssText = 'display:block;background:#2b0d0d;border:1px solid #7a1a1a;color:#f87171;padding:.6rem;border-radius:6px;font-size:.83rem;';
+        resultEl.textContent = 'Network error: ' + err.message;
+        resultEl.style.display = 'block';
+      }} finally {{
+        btn.disabled = false;
+        btn.textContent = 'Guardar cambios';
+      }}
+    }}
+
+    // ── Bulk select ──────────────────────────────────────────────
+    function toggleAll(cb) {{
+      document.querySelectorAll('.post-checkbox').forEach(c => c.checked = cb.checked);
+      updateBulkControls();
+    }}
+
+    function updateBulkControls() {{
+      const checked = document.querySelectorAll('.post-checkbox:checked');
+      const bar = document.getElementById('bulkBar');
+      document.getElementById('bulkCount').textContent = checked.length + ' seleccionado' + (checked.length !== 1 ? 's' : '');
+      bar.style.display = checked.length > 0 ? 'flex' : 'none';
+    }}
+
+    function clearSelection() {{
+      document.querySelectorAll('.post-checkbox').forEach(c => c.checked = false);
+      document.getElementById('selectAll').checked = false;
+      updateBulkControls();
+    }}
+
+    async function doBulkMove() {{
+      const targetId = parseInt(document.getElementById('bulkTarget').value);
+      if (!targetId) {{ alert('Selecciona un canal de destino'); return; }}
+      const ids = Array.from(document.querySelectorAll('.post-checkbox:checked')).map(c => parseInt(c.dataset.postId));
+      if (!ids.length) return;
+      const targetName = document.getElementById('bulkTarget').selectedOptions[0].textContent;
+      if (!confirm('¿Mover ' + ids.length + ' post(s) al canal "' + targetName + '"?')) return;
+
+      try {{
+        const res = await fetch('/api/posts/bulk-move', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{post_ids: ids, target_account_id: targetId}}),
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          alert('✓ ' + data.moved + ' post(s) movidos a "' + targetName + '"');
+          location.reload();
+        }} else {{
+          alert('Error: ' + (data.detail || JSON.stringify(data)));
+        }}
+      }} catch(e) {{
+        alert('Network error: ' + e.message);
+      }}
+    }}
+
+    function extractVideoId(url) {{
+      if (!url) return null;
+      let m = url.match(/youtube\\.com\\/shorts\\/([^?&]+)/);
+      if (m) return m[1];
+      m = url.match(/[?&]v=([^&]+)/);
+      if (m) return m[1];
+      m = url.match(/youtu\\.be\\/([^?&]+)/);
+      if (m) return m[1];
+      return null;
+    }}
+
+    // Close modal with Escape key
+    document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeModal(); }});
+    </script>
+    """
     return HTMLResponse(_layout("Posts", content))
 
 
 @app.post("/posts/{post_id}/retry")
 async def retry_post(post_id: int, user: AuthDep, db: Session = Depends(get_db)):
-    """Reset a failed post to pending so it publishes on the next scheduler tick."""
     post = db.query(ScheduledPost).filter(ScheduledPost.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found.")
+    from datetime import timedelta
     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
     post.status = "pending"
     post.error_message = None
-    # Schedule 1 minute from now so the scheduler picks it up immediately
-    from datetime import timedelta
     post.scheduled_at = now_utc + timedelta(minutes=1)
     db.commit()
     logger.info(f"Post #{post_id} reset to pending, scheduled for 1 min from now.")
@@ -455,7 +795,6 @@ async def reschedule_post(
     scheduled_at: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    """Reschedule a failed or pending post to a new date/time (Madrid timezone)."""
     post = db.query(ScheduledPost).filter(ScheduledPost.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found.")
@@ -481,7 +820,6 @@ async def delete_post(post_id: int, user: AuthDep, db: Session = Depends(get_db)
     post = db.query(ScheduledPost).filter(ScheduledPost.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found.")
-    # Delete the video file if it still exists and post is not published
     if post.status != "published":
         Path(post.file_path).unlink(missing_ok=True)
     db.delete(post)
@@ -494,15 +832,132 @@ async def health():
     return {"status": "ok"}
 
 
+# ------------------------------------------------------------------
+# JSON API
+# ------------------------------------------------------------------
+
 @app.get("/api/accounts")
 async def api_list_accounts(user: AuthDep, db: Session = Depends(get_db)):
-    """Devuelve las cuentas conectadas en formato JSON (para clientes externos)."""
     accounts = db.query(Account).order_by(Account.name).all()
     return [
-        {"id": a.id, "name": a.name, "platform": a.platform,
-         "created_at": a.created_at.isoformat()}
+        {
+            "id": a.id, "name": a.name, "platform": a.platform,
+            "channel_id": a.channel_id,
+            "channel_thumbnail_url": a.channel_thumbnail_url,
+            "created_at": a.created_at.isoformat(),
+        }
         for a in accounts
     ]
+
+
+@app.get("/api/posts/{post_id}")
+async def api_get_post(post_id: int, user: AuthDep, db: Session = Depends(get_db)):
+    post = db.query(ScheduledPost).filter(ScheduledPost.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found.")
+    return {
+        "id": post.id,
+        "account_id": post.account_id,
+        "account_name": post.account.name if post.account else None,
+        "title": post.title,
+        "description": post.description,
+        "tags": post.tags,
+        "scheduled_at": _to_madrid(post.scheduled_at).strftime("%Y-%m-%dT%H:%M"),
+        "status": post.status,
+        "video_url": post.video_url,
+        "error_message": post.error_message,
+        "file_path": post.file_path,
+    }
+
+
+class PostUpdatePayload(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    tags: str | None = None
+    scheduled_at: str | None = None
+    account_id: int | None = None
+
+
+@app.post("/api/posts/{post_id}/update")
+async def update_post(post_id: int, payload: PostUpdatePayload, user: AuthDep, db: Session = Depends(get_db)):
+    post = db.query(ScheduledPost).filter(ScheduledPost.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found.")
+
+    if payload.title is not None:
+        post.title = payload.title
+    if payload.description is not None:
+        post.description = payload.description
+    if payload.tags is not None:
+        post.tags = payload.tags
+    if payload.account_id is not None and post.status in ("pending", "failed"):
+        account = db.query(Account).filter(Account.id == payload.account_id).first()
+        if not account:
+            raise HTTPException(status_code=404, detail="Target account not found.")
+        post.account_id = payload.account_id
+    if payload.scheduled_at and post.status in ("pending", "failed"):
+        try:
+            new_dt = (
+                datetime.fromisoformat(payload.scheduled_at)
+                .replace(tzinfo=MADRID_TZ)
+                .astimezone(timezone.utc)
+                .replace(tzinfo=None)
+            )
+            post.scheduled_at = new_dt
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format.")
+
+    db.commit()
+    logger.info(f"Post #{post_id} updated locally.")
+
+    # If published, try to update on YouTube
+    updated_on_youtube = False
+    youtube_error = None
+    if post.status == "published" and post.video_url and post.account:
+        video_id = _extract_video_id(post.video_url)
+        if video_id:
+            try:
+                publisher = YouTubePublisher(credentials_json=post.account.credentials_json)
+                tags = [t.strip() for t in post.tags.split(",") if t.strip()] if post.tags else []
+                success, error = publisher.update_video(video_id, post.title, post.description or "", tags)
+                if success:
+                    updated_on_youtube = True
+                    post.account.credentials_json = publisher.get_updated_credentials_json()
+                    db.commit()
+                    logger.info(f"Post #{post_id} updated on YouTube: {video_id}")
+                else:
+                    youtube_error = error
+                    logger.warning(f"Post #{post_id} YouTube update failed: {error}")
+            except Exception as e:
+                youtube_error = str(e)
+                logger.error(f"Post #{post_id} YouTube update exception: {e}")
+
+    return JSONResponse({"success": True, "updated_on_youtube": updated_on_youtube, "youtube_error": youtube_error})
+
+
+class BulkMovePayload(BaseModel):
+    post_ids: list[int]
+    target_account_id: int
+
+
+@app.post("/api/posts/bulk-move")
+async def bulk_move_posts(payload: BulkMovePayload, user: AuthDep, db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.id == payload.target_account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Target account not found.")
+
+    moved = 0
+    for post_id in payload.post_ids:
+        post = db.query(ScheduledPost).filter(
+            ScheduledPost.id == post_id,
+            ScheduledPost.status == "pending",
+        ).first()
+        if post:
+            post.account_id = payload.target_account_id
+            moved += 1
+    db.commit()
+    logger.info(f"Bulk move: {moved} posts moved to account #{payload.target_account_id}")
+    return JSONResponse({"success": True, "moved": moved})
 
 
 # ------------------------------------------------------------------
@@ -513,8 +968,8 @@ class QueuePostItem(BaseModel):
     file_path: str
     title: str
     description: str = ""
-    tags: str = ""               # comma-separated
-    publish_date: str = ""       # ISO 8601, e.g. "2026-03-15T18:00:00"
+    tags: str = ""
+    publish_date: str = ""
 
 
 class QueueImportPayload(BaseModel):
@@ -526,7 +981,7 @@ class QueueImportPayload(BaseModel):
 async def import_queue_page(user: AuthDep, db: Session = Depends(get_db)):
     accounts = db.query(Account).order_by(Account.name).all()
     account_options = "".join(
-        f'<option value="{a.id}">[{a.platform.upper()}] {a.name}</option>' for a in accounts
+        f'<option value="{a.id}">[{a.platform.upper()}] {html_lib.escape(a.name)}</option>' for a in accounts
     ) or '<option value="">— No accounts connected —</option>'
 
     content = f"""
@@ -599,27 +1054,6 @@ async def import_queue(
     user: AuthDep,
     db: Session = Depends(get_db),
 ):
-    """
-    Importa una cola de vídeos ya generados (p.ej. desde TikTok Studio).
-
-    Formato JSON:
-    {
-      "account_id": 1,
-      "posts": [
-        {
-          "file_path": "/absolute/path/video.mp4",
-          "title": "Mi Short #1",
-          "description": "Descripción #shorts",
-          "tags": "shorts,viral,tema",
-          "publish_date": "2026-03-15T18:00:00"
-        }
-      ]
-    }
-
-    - publish_date se interpreta en hora de Madrid (Europe/Madrid).
-    - Si publish_date está vacío, se programa para ahora + 1 minuto.
-    - Devuelve la lista de IDs de posts creados.
-    """
     account = db.query(Account).filter(Account.id == payload.account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail=f"Account #{payload.account_id} not found.")
@@ -629,12 +1063,10 @@ async def import_queue(
     errors = []
 
     for item in payload.posts:
-        # Validar que el fichero existe
         if not Path(item.file_path).is_file():
             errors.append({"file_path": item.file_path, "error": "File not found"})
             continue
 
-        # Parsear fecha
         if item.publish_date:
             try:
                 scheduled_dt = (
@@ -675,14 +1107,12 @@ async def import_queue(
 
 @app.get("/debug", response_class=HTMLResponse)
 async def debug(user: AuthDep):
-    """Shows configuration status to help diagnose issues."""
     client_id = os.getenv("YOUTUBE_CLIENT_ID", "")
     client_secret = os.getenv("YOUTUBE_CLIENT_SECRET", "")
     secrets_path = os.getenv("YOUTUBE_CLIENT_SECRETS_PATH", "auth/client_secrets.json")
 
     checks = []
 
-    # Check YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET
     if client_id and client_secret:
         checks.append(("YOUTUBE_CLIENT_ID", "ok", client_id[:20] + "..."))
         checks.append(("YOUTUBE_CLIENT_SECRET", "ok", "Set (hidden)"))
@@ -691,28 +1121,24 @@ async def debug(user: AuthDep):
                        "NOT SET" if not client_id else client_id[:20] + "..."))
         checks.append(("YOUTUBE_CLIENT_SECRET", "error" if not client_secret else "ok",
                        "NOT SET" if not client_secret else "Set (hidden)"))
-        # Check file fallback
         if os.path.exists(secrets_path):
             checks.append(("client_secrets.json file", "ok", f"Found at {secrets_path}"))
         else:
             checks.append(("client_secrets.json file", "error", f"Not found at {secrets_path}"))
 
-    # Check OAUTH_REDIRECT_URI
     redirect_uri = os.getenv("OAUTH_REDIRECT_URI", "NOT SET")
     checks.append(("OAUTH_REDIRECT_URI", "ok" if redirect_uri != "NOT SET" else "error", redirect_uri))
 
-    # Check DATABASE_URL
     db_url = os.getenv("DATABASE_URL", "sqlite:///./data/viraldistributor.db (default)")
     checks.append(("DATABASE_URL", "ok", db_url))
 
-    # Check data dir
     checks.append(("data/ directory", "ok" if os.path.isdir("data") else "error",
                    "exists" if os.path.isdir("data") else "MISSING — DB cannot be created"))
 
     rows = ""
-    for name, status, detail in checks:
-        color = {"ok": "#4ade80", "warn": "#fbbf24", "error": "#f87171"}[status]
-        icon = {"ok": "OK", "warn": "WARN", "error": "ERR"}[status]
+    for name, st, detail in checks:
+        color = {"ok": "#4ade80", "warn": "#fbbf24", "error": "#f87171"}[st]
+        icon = {"ok": "OK", "warn": "WARN", "error": "ERR"}[st]
         rows += f"<tr><td>{name}</td><td><span class='badge' style='background:#1a1a1a;color:{color};'>{icon}</span></td><td style='color:#aaa;font-size:.8rem;'>{detail}</td></tr>"
 
     content = f"""
@@ -729,12 +1155,10 @@ async def debug(user: AuthDep):
 # ------------------------------------------------------------------
 
 def _to_madrid(dt: datetime) -> datetime:
-    """Convert naive UTC datetime to Madrid time."""
     return dt.replace(tzinfo=timezone.utc).astimezone(MADRID_TZ)
 
 
 def _countdown(scheduled_at: datetime, now_utc: datetime) -> str:
-    """Human-readable countdown from now until scheduled_at (both naive UTC)."""
     diff = scheduled_at - now_utc
     total = int(diff.total_seconds())
     if total <= 0:
@@ -750,6 +1174,19 @@ def _countdown(scheduled_at: datetime, now_utc: datetime) -> str:
     if minutes and not days:
         parts.append(f"{minutes} min")
     return ", ".join(parts) or "Menos de 1 min"
+
+
+def _extract_video_id(video_url: str) -> str | None:
+    if not video_url:
+        return None
+    if "youtube.com/shorts/" in video_url:
+        return video_url.split("youtube.com/shorts/")[-1].split("?")[0]
+    if "youtube.com/watch" in video_url:
+        params = parse_qs(urlparse(video_url).query)
+        return params.get("v", [None])[0]
+    if "youtu.be/" in video_url:
+        return video_url.split("youtu.be/")[-1].split("?")[0]
+    return None
 
 
 def _layout(title: str, content: str) -> str:
@@ -777,7 +1214,7 @@ def _layout(title: str, content: str) -> str:
 
     /* Main */
     main {{ flex: 1; padding: 2rem; overflow-y: auto; }}
-    .page-header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }}
+    .page-header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; flex-wrap: wrap; gap: .75rem; }}
     .page-header h2 {{ font-size: 1.25rem; color: #f0f0f0; }}
 
     /* Cards */
@@ -815,6 +1252,13 @@ def _layout(title: str, content: str) -> str:
     .badge-pending {{ background: #1a1500; color: #fbbf24; }}
     .badge-published {{ background: #0d2b1a; color: #4ade80; }}
     .badge-failed {{ background: #2b0d0d; color: #f87171; }}
+
+    /* Modal form fields */
+    #postModal label {{ margin-top: 0; }}
+    #postModal input[type=text], #postModal input[type=datetime-local], #postModal textarea, #postModal select {{
+      background: #0f0f0f; border: 1px solid #333; border-radius: 6px; color: #e0e0e0;
+    }}
+    #postModal input:disabled, #postModal select:disabled {{ opacity: .4; cursor: not-allowed; }}
   </style>
 </head>
 <body>

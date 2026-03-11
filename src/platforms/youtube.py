@@ -14,7 +14,10 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.force-ssl",  # needed for videos.update
+]
 
 
 class YouTubePublisher(BasePlatformPublisher):
@@ -191,6 +194,56 @@ class YouTubePublisher(BasePlatformPublisher):
     def get_updated_credentials_json(self) -> str:
         """Call after publish() to persist a refreshed token back to the DB."""
         return self._credentials_to_json(self._credentials)
+
+    def get_channel_info(self) -> dict | None:
+        """Fetch the authenticated user's YouTube channel ID and thumbnail URL."""
+        try:
+            self.authenticate()
+            youtube = build("youtube", "v3", credentials=self._credentials)
+            resp = youtube.channels().list(part="snippet", mine=True).execute()
+            items = resp.get("items", [])
+            if items:
+                channel = items[0]
+                thumbnails = channel["snippet"].get("thumbnails", {})
+                thumb_url = (
+                    thumbnails.get("default", {}).get("url")
+                    or thumbnails.get("medium", {}).get("url")
+                )
+                return {"channel_id": channel["id"], "thumbnail_url": thumb_url}
+        except Exception as e:
+            logger.warning(f"Could not fetch channel info: {e}")
+        return None
+
+    def update_video(self, video_id: str, title: str, description: str, tags: list[str]) -> tuple[bool, str]:
+        """Update published video metadata. Returns (success, error_message)."""
+        try:
+            self.authenticate()
+            youtube = build("youtube", "v3", credentials=self._credentials)
+            body = {
+                "id": video_id,
+                "snippet": {
+                    "title": title,
+                    "description": description,
+                    "tags": tags,
+                    "categoryId": "22",
+                },
+            }
+            youtube.videos().update(part="snippet", body=body).execute()
+            return True, ""
+        except HttpError as e:
+            if e.resp.status == 403:
+                return False, "Cuenta sin permiso para editar vídeos — reconecta la cuenta para habilitar esta función."
+            try:
+                err_body = e.content.decode("utf-8") if isinstance(e.content, bytes) else str(e.content)
+            except Exception:
+                err_body = repr(e.content)
+            detail = f"YouTube API error HTTP {e.resp.status}: {err_body}"
+            logger.error(f"update_video failed: {detail}")
+            return False, detail
+        except Exception as e:
+            detail = str(e)
+            logger.error(f"update_video failed: {detail}")
+            return False, detail
 
     # ------------------------------------------------------------------
     # Helpers
